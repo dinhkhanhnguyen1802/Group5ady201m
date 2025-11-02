@@ -1,0 +1,127 @@
+import pandas as pd
+from datetime import datetime, timedelta
+from vnstock import Vnstock
+from sqlalchemy import create_engine, text
+
+# ==== KẾT NỐI DB ====
+def get_engine():
+    return create_engine(
+        "mssql+pyodbc://sa:123456@localhost\\SQLEXPRESS/FPT_StockDB"
+        "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes",
+        fast_executemany=True
+    )
+
+# ==== LẤY DỮ LIỆU ====
+def get_stock_data_range(symbol, start, end):
+    f = Vnstock().stock(symbol=symbol, source="VCI")
+    df = f.quote.history(start=start, end=end)  # trả về DataFrame ngày
+    if df.empty:
+        return pd.DataFrame()
+    date_col = "time" if "time" in df.columns else "date"
+    df = df.rename(columns={date_col: "date"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    return df
+
+# ==== TRUY VẤN DB ====
+def get_max_date_in_db(engine, table="FPT_Stock"):
+    try:
+        with engine.connect() as conn:
+            max_d = conn.execute(text(f"SELECT MAX([date]) FROM {table}")).scalar()
+        return pd.to_datetime(max_d) if max_d else None
+    except Exception:
+        # bảng chưa tồn tại
+        return None
+
+def replace_overlap_and_append(engine, df_new, table="FPT_Stock", cutoff_date=None):
+    # xóa phần chồng lấn rồi append
+    with engine.begin() as conn:
+        if cutoff_date is not None:
+            conn.execute(
+                text(f"DELETE FROM {table} WHERE [date] >= :d"), {"d": cutoff_date}
+            )
+    df_new.to_sql(table, con=engine, if_exists="append", index=False)
+
+# ==== HIỂN THỊ NGÀY MỚI NHẤT ====
+def display_latest_from_db(engine, table="FPT_Stock"):
+    # Lấy 2 dòng mới nhất để tính % thay đổi
+    q = f"SELECT TOP 2 * FROM {table} ORDER BY [date] DESC"
+    df = pd.read_sql(q, con=engine)
+    if df.empty:
+        print("❌ Chưa có dữ liệu trong DB.")
+        return
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")  # nhỏ -> lớn để lấy 2 dòng cuối
+    latest = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else None
+
+    current_price = latest["close"]
+    if prev is not None:
+        price_change = current_price - prev["close"]
+        percent_change = price_change / prev["close"] * 100
+    else:
+        price_change = 0
+        percent_change = 0.0
+
+    print("🚀 PHÂN TÍCH CỔ PHIẾU FPT (ngày gần nhất)")
+    print("=" * 50)
+    print(f"📅 Ngày: {latest['date'].strftime('%d/%m/%Y')}")
+    print(f"📊 Giá đóng cửa: {current_price:,.0f} VND")
+    print(f"📈 Thay đổi: {price_change:+,.0f} VND ({percent_change:+.2f}%)")
+    print(f"🔼 Cao nhất: {latest['high']:,.0f} | 🔽 Thấp nhất: {latest['low']:,.0f}")
+    print(f"📦 Khối lượng: {latest['volume']:,.0f}")
+    print("=" * 50)
+
+# ==== MAIN: CHỈ CẬP NHẬT PHẦN MỚI ====
+if __name__ == "__main__":
+    symbol = "FPT"
+    today = datetime.today().strftime("%Y-%m-%d")
+
+    engine = get_engine()
+    last_date = get_max_date_in_db(engine)
+
+    if last_date is None:
+        # Lần đầu: tải 5 năm
+        start = (datetime.today() - timedelta(days=1825)).strftime("%Y-%m-%d")
+        df_full = get_stock_data_range(symbol, start, today)
+        if df_full.empty:
+            print("❌ Không có dữ liệu.")
+        else:
+            # tạo mới toàn bộ
+            df_full.to_sql("FPT_Stock", con=engine, if_exists="replace", index=False)
+            print(f"✅ Khởi tạo bảng với {len(df_full):,} dòng.")
+    else:
+        # Các lần sau: chỉ lấy từ last_date lùi 5 ngày để ghi đè
+        overlap_days = 5
+        start = (last_date - timedelta(days=overlap_days)).strftime("%Y-%m-%d")
+        df_inc = get_stock_data_range(symbol, start, today)
+        if df_inc.empty:
+            print("ℹ️ Không có dữ liệu mới.")
+        else:
+            replace_overlap_and_append(engine, df_inc, cutoff_date=start)
+            print(f"✅ Cập nhật {len(df_inc):,} dòng mới/ghi đè phần chồng lấn từ {start}.")
+
+    # In ra ngày gần nhất (không cần load 5 năm)
+    display_latest_from_db(engine)
+
+summary = {
+    "Số dòng": len(df),
+    "Số cột": df.shape[1],
+}
+if "date" in df.columns:
+    summary.update({
+        "Từ ngày": df["date"].min(),
+        "Đến ngày": df["date"].max(),
+        "Đã sắp xếp theo ngày": bool(df["date"].is_monotonic_increasing),
+    })
+pd.Series(summary)
+
+# Bảng type của từng cột
+dtype_df = pd.DataFrame({
+    "column": df.columns,
+    "dtype": df.dtypes.astype(str).values,
+    "n_unique": [df[c].nunique(dropna=True) for c in df.columns],
+})
+dtype_df
+
+
