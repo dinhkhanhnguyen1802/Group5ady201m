@@ -11,7 +11,7 @@ def get_engine():
         fast_executemany=True
     )
 
-# ==== LẤY DỮ LIỆU ====
+
 def get_stock_data_range(symbol, start, end):
     f = Vnstock().stock(symbol=symbol, source="VCI")
     df = f.quote.history(start=start, end=end)  # trả về DataFrame ngày
@@ -23,7 +23,7 @@ def get_stock_data_range(symbol, start, end):
     df = df.sort_values("date").reset_index(drop=True)
     return df
 
-# ==== TRUY VẤN DB ====
+
 def get_max_date_in_db(engine, table="FPT_Stock"):
     try:
         with engine.connect() as conn:
@@ -42,7 +42,7 @@ def replace_overlap_and_append(engine, df_new, table="FPT_Stock", cutoff_date=No
             )
     df_new.to_sql(table, con=engine, if_exists="append", index=False)
 
-# ==== HIỂN THỊ NGÀY MỚI NHẤT ====
+
 def display_latest_from_db(engine, table="FPT_Stock"):
     # Lấy 2 dòng mới nhất để tính % thay đổi
     q = f"SELECT TOP 2 * FROM {table} ORDER BY [date] DESC"
@@ -72,7 +72,7 @@ def display_latest_from_db(engine, table="FPT_Stock"):
     print(f"📦 Khối lượng: {latest['volume']:,.0f}")
     print("=" * 50)
 
-# ==== MAIN: CHỈ CẬP NHẬT PHẦN MỚI ====
+
 if __name__ == "__main__":
     symbol = "FPT"
     today = datetime.today().strftime("%Y-%m-%d")
@@ -123,5 +123,6 @@ dtype_df = pd.DataFrame({
     "n_unique": [df[c].nunique(dropna=True) for c in df.columns],
 })
 dtype_df
+
 
 
