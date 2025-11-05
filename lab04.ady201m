@@ -1,0 +1,232 @@
+import pandas as pd
+from datetime import datetime, timedelta
+from vnstock import Vnstock
+from sqlalchemy import create_engine, text
+
+# ==== KẾT NỐI DB ====
+def get_engine():
+    return create_engine(
+        "mssql+pyodbc://sa:123456@localhost\\SQLEXPRESS/FPT_StockDB"
+        "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes",
+        fast_executemany=True
+    )
+
+# ==== LẤY DỮ LIỆU ====
+def get_stock_data_range(symbol, start, end):
+    f = Vnstock().stock(symbol=symbol, source="VCI")
+    df = f.quote.history(start=start, end=end)  # trả về DataFrame ngày
+    if df.empty:
+        return pd.DataFrame()
+    date_col = "time" if "time" in df.columns else "date"
+    df = df.rename(columns={date_col: "date"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+    return df
+
+# ==== TRUY VẤN DB ====
+def get_max_date_in_db(engine, table="FPT_Stock"):
+    try:
+        with engine.connect() as conn:
+            max_d = conn.execute(text(f"SELECT MAX([date]) FROM {table}")).scalar()
+        return pd.to_datetime(max_d) if max_d else None
+    except Exception:
+        # bảng chưa tồn tại
+        return None
+
+def replace_overlap_and_append(engine, df_new, table="FPT_Stock", cutoff_date=None):
+    # xóa phần chồng lấn rồi append
+    with engine.begin() as conn:
+        if cutoff_date is not None:
+            conn.execute(
+                text(f"DELETE FROM {table} WHERE [date] >= :d"), {"d": cutoff_date}
+            )
+    df_new.to_sql(table, con=engine, if_exists="append", index=False)
+
+# ==== HIỂN THỊ NGÀY MỚI NHẤT ====
+def display_latest_from_db(engine, table="FPT_Stock"):
+    # Lấy 2 dòng mới nhất để tính % thay đổi
+    q = f"SELECT TOP 2 * FROM {table} ORDER BY [date] DESC"
+    df = pd.read_sql(q, con=engine)
+    if df.empty:
+        print("❌ Chưa có dữ liệu trong DB.")
+        return
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")  # nhỏ -> lớn để lấy 2 dòng cuối
+    latest = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) > 1 else None
+
+    current_price = latest["close"]
+    if prev is not None:
+        price_change = current_price - prev["close"]
+        percent_change = price_change / prev["close"] * 100
+    else:
+        price_change = 0
+        percent_change = 0.0
+
+    print("🚀 PHÂN TÍCH CỔ PHIẾU FPT (ngày gần nhất)")
+    print("=" * 50)
+    print(f"📅 Ngày: {latest['date'].strftime('%d/%m/%Y')}")
+    print(f"📊 Giá đóng cửa: {current_price:,.0f} VND")
+    print(f"📈 Thay đổi: {price_change:+,.0f} VND ({percent_change:+.2f}%)")
+    print(f"🔼 Cao nhất: {latest['high']:,.0f} | 🔽 Thấp nhất: {latest['low']:,.0f}")
+    print(f"📦 Khối lượng: {latest['volume']:,.0f}")
+    print("=" * 50)
+
+# ==== MAIN: CHỈ CẬP NHẬT PHẦN MỚI ====
+if __name__ == "__main__":
+    symbol = "FPT"
+    today = datetime.today().strftime("%Y-%m-%d")
+
+    engine = get_engine()
+    last_date = get_max_date_in_db(engine)
+
+    if last_date is None:
+        # Lần đầu: tải 5 năm
+        start = (datetime.today() - timedelta(days=1825)).strftime("%Y-%m-%d")
+        df_full = get_stock_data_range(symbol, start, today)
+        if df_full.empty:
+            print("❌ Không có dữ liệu.")
+        else:
+            # tạo mới toàn bộ
+            df_full.to_sql("FPT_Stock", con=engine, if_exists="replace", index=False)
+            print(f"✅ Khởi tạo bảng với {len(df_full):,} dòng.")
+    else:
+        # Các lần sau: chỉ lấy từ last_date lùi 5 ngày để ghi đè
+        overlap_days = 5
+        start = (last_date - timedelta(days=overlap_days)).strftime("%Y-%m-%d")
+        df_inc = get_stock_data_range(symbol, start, today)
+        if df_inc.empty:
+            print("ℹ️ Không có dữ liệu mới.")
+        else:
+            replace_overlap_and_append(engine, df_inc, cutoff_date=start)
+            print(f"✅ Cập nhật {len(df_inc):,} dòng mới/ghi đè phần chồng lấn từ {start}.")
+
+    # In ra ngày gần nhất (không cần load 5 năm)
+    display_latest_from_db(engine)
+
+import os
+import pandas as pd
+from datetime import datetime, timedelta
+from sqlalchemy import create_engine, text
+
+# --- OPTIONAL fallback nếu DB trống ---
+from vnstock import Vnstock
+
+# ========= KẾT NỐI DB =========
+def get_engine():
+    return create_engine(
+        "mssql+pyodbc://sa:123456@localhost\\SQLEXPRESS/FPT_StockDB"
+        "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes",
+        fast_executemany=True
+    )
+
+# ========= LOAD DỮ LIỆU =========
+def load_last_n_days(engine, table="FPT_Stock", n=365):
+    q = f"""SELECT TOP {n} [date],[open],[high],[low],[close],[volume]
+            FROM {table} ORDER BY [date] DESC"""
+    df = pd.read_sql(q, con=engine)
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values("date").reset_index(drop=True)
+
+def fetch_from_api(symbol="FPT", days=365):
+    f = Vnstock().stock(symbol=symbol, source="VCI")
+    end = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+    df = f.quote.history(start=start, end=end)
+    if df.empty:
+        return df
+    date_col = "time" if "time" in df.columns else "date"
+    df = df.rename(columns={date_col: "date"})
+    df["date"] = pd.to_datetime(df["date"])
+    return df.sort_values("date").reset_index(drop=True)
+
+# ========= TÍNH CHỈ BÁO =========
+def add_indicators(df, sma=(20,50), ema=(12,26), bb=20):
+    # SMA
+    for w in sma:
+        df[f"SMA{w}"] = df["close"].rolling(w).mean()
+    # EMA
+    for w in ema:
+        df[f"EMA{w}"] = df["close"].ewm(span=w, adjust=False).mean()
+    # Bollinger (MA +/− 2σ)
+    if bb:
+        ma = df["close"].rolling(bb).mean()
+        std = df["close"].rolling(bb).std()
+        df[f"BB_MA{bb}"]  = ma
+        df[f"BB_UP{bb}"]  = ma + 2*std
+        df[f"BB_LOW{bb}"] = ma - 2*std
+    return df
+
+# ========= VẼ PLOTLY =========
+import plotly.graph_objects as go
+
+def plot_all(df, symbol="FPT", save_html=True, outdir="reports/figures"):
+    if df.empty:
+        print("❌ Không có dữ liệu để vẽ."); return
+    if save_html:
+        os.makedirs(outdir, exist_ok=True)
+
+    # 1) Close + MA
+    traces = [go.Scatter(x=df["date"], y=df["close"], mode="lines", name="Close")]
+    for c in [c for c in df.columns if c.startswith(("SMA","EMA"))]:
+        traces.append(go.Scatter(x=df["date"], y=df[c], mode="lines", name=c))
+    if set([c for c in df.columns if c.startswith("BB_")]):
+        traces += [
+            go.Scatter(x=df["date"], y=df[[c for c in df.columns if c.startswith("BB_UP")][0]],
+                       mode="lines", name="BB Upper"),
+            go.Scatter(x=df["date"], y=df[[c for c in df.columns if c.startswith("BB_MA")][0]],
+                       mode="lines", name="BB MA"),
+            go.Scatter(x=df["date"], y=df[[c for c in df.columns if c.startswith("BB_LOW")][0]],
+                       mode="lines", name="BB Lower"),
+        ]
+    fig1 = go.Figure(traces)
+    fig1.update_layout(title=f"{symbol} – Close & Moving Averages",
+                       xaxis_title="Date", yaxis_title="Price (VND)")
+    if save_html: fig1.write_html(f"{outdir}/close_ma.html", include_plotlyjs="cdn")
+    fig1.show()
+
+    # 2) Volume
+    if "volume" in df.columns:
+        fig2 = go.Figure([go.Bar(x=df["date"], y=df["volume"], name="Volume")])
+        fig2.update_layout(title=f"{symbol} – Volume", xaxis_title="Date", yaxis_title="Volume")
+        if save_html: fig2.write_html(f"{outdir}/volume.html", include_plotlyjs="cdn")
+        fig2.show()
+
+    # 3) Candlestick + MA
+    fig4 = go.Figure([go.Candlestick(
+        x=df["date"], open=df["open"], high=df["high"], low=df["low"], close=df["close"], name="OHLC"
+    )])
+    for c in [c for c in df.columns if c.startswith(("SMA","EMA"))]:
+        fig4.add_trace(go.Scatter(x=df["date"], y=df[c], mode="lines", name=c))
+    fig4.update_layout(title=f"{symbol} – Candlestick + MA",
+                       xaxis_title="Date", yaxis_title="Price (VND)",
+                       xaxis_rangeslider_visible=False)
+    if save_html: fig4.write_html(f"{outdir}/candlestick.html", include_plotlyjs="cdn")
+    fig4.show()
+
+# ========= MAIN: CHỈ VẼ =========
+if __name__ == "__main__":
+    symbol = "FPT"
+    n_days = 365
+    engine = get_engine()
+
+    df = load_last_n_days(engine, table="FPT_Stock", n=n_days)
+    if df.empty:
+        print("ℹ️ DB trống, lấy tạm từ API (không ghi DB).")
+        df = fetch_from_api(symbol=symbol, days=n_days)
+
+    # Thêm SMA/EMA/Bollinger tuỳ ý
+    df = add_indicators(df, sma=(20,50,200), ema=(12,26), bb=20)
+
+    # Vẽ tương tác
+    plot_all(df, symbol=symbol, save_html=True, outdir="reports/figures")
+
+
+
+
+
+
+
+
