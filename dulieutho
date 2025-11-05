@@ -1,0 +1,203 @@
+import pandas as pd
+from datetime import datetime, timedelta
+from vnstock import Vnstock
+from sqlalchemy import create_engine
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+def get_stock_data(symbol="FPT", days=1825):
+    """
+    Lấy dữ liệu cổ phiếu từ vnstock3 trong khoảng N ngày gần nhất
+    """
+    end = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+    
+    fpt = Vnstock().stock(symbol=symbol, source="VCI")
+    df = fpt.quote.history(start=start, end=end)
+    
+    if df.empty:
+        print("❌ Không có dữ liệu.")
+        return pd.DataFrame()
+    
+    date_col = "time" if "time" in df.columns else "date"
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.rename(columns={date_col: "date"})
+    df = df.sort_values("date")
+    
+    return df
+
+def save_to_sql(df):
+    """
+    Cập nhật dữ liệu ngày mới nhất vào SQL Server
+    """
+    try:
+        engine = create_engine(
+            "mssql+pyodbc://sa:123456@localhost\\SQLEXPRESS/FPT_StockDB"
+            "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes",
+            fast_executemany=True
+        )
+
+        # Đọc dữ liệu hiện có (nếu bảng đã tồn tại)
+        existing = pd.read_sql("SELECT date FROM dbo.FPT_Stock", con=engine)
+        existing['date'] = pd.to_datetime(existing['date'])
+
+        # Lọc ra các ngày chưa có trong SQL
+        new_data = df[~df['date'].isin(existing['date'])]
+
+        if new_data.empty:
+            print("✅ Dữ liệu đã được cập nhật, không có gì mới.")
+            return
+
+        # Ghi thêm dữ liệu mới (append)
+        new_data.to_sql("FPT_Stock", con=engine, schema="dbo",
+                        if_exists="append", index=False, method="multi", chunksize=1000)
+        print(f"✅ Đã thêm {len(new_data)} dòng dữ liệu mới vào SQL Server!")
+
+    except Exception as e:
+        # Nếu bảng chưa tồn tại, tạo mới
+        if "FPT_Stock" in str(e):
+            df.to_sql("FPT_Stock", con=engine, schema="dbo",
+                      if_exists="replace", index=False, method="multi", chunksize=1000)
+            print("⚙️ Bảng mới được tạo trong SQL Server!")
+        else:
+            print("❌ Lỗi khi ghi dữ liệu vào SQL:", e)
+
+def plot_stock_data(df):
+    """
+    Vẽ biểu đồ giá cổ phiếu
+    """
+    if df.empty:
+        print("❌ Không có dữ liệu để vẽ biểu đồ.")
+        return
+    
+    # Tạo figure với 2 subplot
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+    
+    # Biểu đồ 1: Giá đóng cửa
+    ax1.plot(df['date'], df['close'], linewidth=2, color='blue', label='Giá đóng cửa')
+    ax1.set_title('📈 BIỂU ĐỒ GIÁ CỔ PHIẾU FPT', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Giá (VND)', fontsize=12)
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Định dạng trục x cho biểu đồ giá
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    ax1.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    
+    # Biểu đồ 2: Khối lượng giao dịch
+    ax2.bar(df['date'], df['volume'], color='orange', alpha=0.7, label='Khối lượng')
+    ax2.set_title('📊 KHỐI LƯỢNG GIAO DỊCH', fontsize=12, fontweight='bold')
+    ax2.set_xlabel('Thời gian', fontsize=12)
+    ax2.set_ylabel('Khối lượng', fontsize=12)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    # Định dạng trục x cho biểu đồ khối lượng
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    ax2.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    
+    # Tự động xoay nhãn trục x
+    plt.gcf().autofmt_xdate()
+    
+    # Hiển thị biểu đồ
+    plt.tight_layout()
+    plt.show()
+    
+    # Vẽ thêm biểu đồ nến (OHLC) cho 60 ngày gần nhất
+    plot_candlestick(df.tail(60))
+
+def plot_candlestick(df):
+    """
+    Vẽ biểu đồ nến (candlestick) cho dữ liệu gần nhất
+    """
+    if len(df) < 2:
+        print("❌ Không đủ dữ liệu để vẽ biểu đồ nến.")
+        return
+    
+    try:
+        from mplfinance.original_flavor import candlestick_ohlc
+        import matplotlib.dates as mdates
+        
+        # Chuẩn bị dữ liệu cho biểu đồ nến
+        df_ohlc = df[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
+        df_ohlc['date'] = mdates.date2num(df_ohlc['date'])
+        
+        # Tạo figure
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+        
+        # Vẽ biểu đồ nến
+        candlestick_ohlc(ax1, df_ohlc.values, width=0.6, colorup='g', colordown='r', alpha=0.8)
+        ax1.set_title('🕯️ BIỂU ĐỒ NẾN FPT (60 ngày gần nhất)', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('Giá (VND)', fontsize=12)
+        ax1.grid(True, alpha=0.3)
+        
+        # Định dạng trục x
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        ax1.xaxis.set_major_locator(mdates.WeekdayLocator(interval=2))
+        
+        # Biểu đồ khối lượng
+        ax2.bar(df['date'], df['volume'], color='orange', alpha=0.7)
+        ax2.set_title('Khối lượng giao dịch', fontsize=12)
+        ax2.set_xlabel('Ngày', fontsize=12)
+        ax2.set_ylabel('Khối lượng', fontsize=12)
+        ax2.grid(True, alpha=0.3)
+        
+        # Định dạng trục x
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        ax2.xaxis.set_major_locator(mdates.WeekdayLocator(interval=2))
+        
+        plt.gcf().autofmt_xdate()
+        plt.tight_layout()
+        plt.show()
+        
+    except ImportError:
+        print("⚠️  Không thể vẽ biểu đồ nến. Cài đặt: pip install mplfinance")
+
+def display_stock_analysis(df):
+    """
+    Hiển thị dashboard phân tích dữ liệu cổ phiếu
+    """
+    print("🚀 PHÂN TÍCH CỔ PHIẾU FPT")
+    print("=" * 50)
+
+    if df.empty:
+        print("❌ Không có dữ liệu để phân tích.")
+        return
+
+    # Tính toán metrics
+    current_price = df['close'].iloc[-1]
+    price_change = df['close'].iloc[-1] - df['close'].iloc[-2]
+    percent_change = (price_change / df['close'].iloc[-2]) * 100
+    avg_volume = df['volume'].mean()
+    
+    # Thêm các chỉ số khác
+    max_price = df['close'].max()
+    min_price = df['close'].min()
+    volatility = df['close'].pct_change().std() * 100  # Độ biến động (%)
+    
+    print(f"📊 Giá hiện tại: {current_price:,.0f} VND")
+    print(f"📈 Thay đổi: {price_change:+,.0f} VND ({percent_change:+.2f}%)")
+    print(f"📦 Khối lượng TB: {avg_volume:,.0f}")
+    print(f"🎯 Giá cao nhất: {max_price:,.0f} VND")
+    print(f"🔻 Giá thấp nhất: {min_price:,.0f} VND")
+    print(f"🌊 Độ biến động: {volatility:.2f}%")
+    print(f"📅 Số ngày dữ liệu: {len(df)}")
+    print("=" * 50)
+
+    # Bảng dữ liệu
+    print("\n📋 DỮ LIỆU CHI TIẾT (10 ngày gần nhất):")
+    df_show = df.tail(10).copy()
+    df_show['date'] = df_show['date'].dt.strftime('%d/%m/%Y')
+    for col in ['open', 'high', 'low', 'close']:
+        df_show[col] = df_show[col].apply(lambda x: f"{x:,.0f}")
+    df_show['volume'] = df_show['volume'].apply(lambda x: f"{x:,.0f}")
+    print(df_show.to_string(index=False))
+
+# ------------------------- MAIN -------------------------
+if __name__ == "__main__":
+    df = get_stock_data(symbol="FPT", days=1825)
+    
+    if not df.empty:
+        display_stock_analysis(df)
+        plot_stock_data(df)  # Thêm biểu đồ
+        save_to_sql(df)
